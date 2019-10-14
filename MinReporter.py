@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 from typing import Generator, Dict, List
 import asyncio
@@ -83,6 +83,8 @@ class Clan:
 
         return members
 
+    # TODO move private member info generation to clan-level function
+
 
 class Member:
     def __init__(self, member_id: str, display_name: str, member_type: str, join_date: str, clan: Clan) -> None:
@@ -92,25 +94,22 @@ class Member:
         self.display_name: str = display_name
         self.member_type = member_type
         self.join_date = join_date
-        self.private = False
         self.characters = self.get_characters()
+        self.player_relationships: dict = dict()
 
     def get_characters(self) -> dict:
         """
         See Clan.get_members
         """
         characters: Dict[str, Character] = dict()
-        try:
-            response = self.clan.bungo.async_query(f"Destiny2/{self.member_type}/Profile/{self.member_id}/",
-                                             params={'components': 'Profiles,Characters'})
+        response = self.clan.bungo.async_query(f"Destiny2/{self.member_type}/Profile/{self.member_id}/",
+                                         params={'components': 'Profiles,Characters'})
 
-            for character_id in response['Response']['profile']['data']['characterIds']:
-                characters[character_id] = Character(character_id, self)
+        self.private: bool = not response['Response']['profile']['data']['userInfo']['isPublic']
+        for character_id in response['Response']['profile']['data']['characterIds']:
+            characters[character_id] = Character(character_id, self)
 
-            return characters
-
-        except:
-            return dict()
+        return characters
 
     async def players_in_activity(self, activity_id) -> list:
         """
@@ -127,16 +126,17 @@ class Member:
 
         return activity_players
 
-    def recent_players_and_activities(self, search_depth=50) -> None:
+    # TODO decide if repeating these args everywhere is acceptable
+    def recent_players_and_activities(self, search_depth = 50, relevant_days = 30) -> None:
         """
         Accumulates the X most recent activities from each character as specified by search_depth.
         Then for each activity retrieves all players.
         Used to view data per. member rather than per. character
         """
-        self.activities: Dict[str, str] = dict() # { activity_id : timestamp }
+        self.activities: Dict[str, datetime] = dict() # { activity_id : timestamp }
         self.recent_players: List[str] = list() # [ *player_id ]
 
-        get_recent_activities = (character.recent_activities(activity_count=search_depth) for character_id, character in self.characters.items())
+        get_recent_activities = (character.recent_activities(activity_count = search_depth, relevant_days = relevant_days) for character_id, character in self.characters.items())
         for activity in self.clan.bungo.batch_query(get_recent_activities):
             self.activities.update(activity)
 
@@ -144,29 +144,39 @@ class Member:
         for activity_players in self.clan.bungo.batch_query(get_recent_players):
             self.recent_players += activity_players
 
-    def recent_clanmates(self, activity_count=50) -> Dict[str, Dict[str, dict]]:
+    def recent_clanmates(self, activity_count = 50, relevant_days = 30) -> Dict[str, Dict[str, dict]]:
         """
         Builds off of recent_players_and_activities().
         Cross-references each recent player ID against clan member IDs and counts the number of occurrences.
         """
         if not hasattr(self, "recent_players"):
-            self.recent_players_and_activities(search_depth=activity_count)
+            self.recent_players_and_activities(search_depth = activity_count, relevant_days = relevant_days)
 
-        player_relationships: Dict[str, Dict[str, dict]] = dict() # { member_id : { 'display_name' : str, 'times_played' : int }}
-        for player in self.recent_players:
-            if player == self.member_id: # Gotta exclude ourselves
+        for player_id in self.recent_players:
+            if player_id == self.member_id: # Gotta exclude ourselves
                 continue
 
-            if player in self.clan.members:
-                if player not in player_relationships:
-                    player_relationships[player] = {
-                        "display_name": self.clan.members[player].display_name,
+            if player_id in self.clan.members:
+                # If we find a private player in a member's stats, we can update the private players activity
+                if self.clan.members[player_id].private:
+                    private_member: Member = self.clan.members[player_id]
+                    if self.member_id not in private_member.player_relationships:
+                        private_member.player_relationships[self.member_id] = {
+                            "display_name": member.display_name,
+                            "times_played": 1}
+
+                    else:
+                        private_member.player_relationships[self.member_id]['times_played'] += 1
+
+                if player_id not in self.player_relationships:
+                    self.player_relationships[player_id] = {
+                        "display_name": self.clan.members[player_id].display_name,
                         "times_played": 1}
 
                 else:
-                    player_relationships[player]['times_played'] += 1
+                    self.player_relationships[player_id]['times_played'] += 1
 
-        return player_relationships
+        return self.player_relationships
 
 
 class Character:
@@ -174,54 +184,48 @@ class Character:
         self.character_id: str = character_id
         self.member: Member = member
 
-    async def recent_activities(self, activity_count=50) -> Dict[str, datetime]:
+    async def recent_activities(self, activity_count = 50, relevant_days = 30) -> Dict[str, datetime]:
         """
         Lookup up X most recent activities based on activity_count then attempt to get the activity ID and timestamp.
         This is also our test to see if the player is set to private.
         This is async because we use it in a generator later, so it has to be executed in an event loop.
         """
+        activities: Dict[str, datetime] = dict()
+        if self.member.private:
+            return activities
+
         response = await self.member.clan.bungo.async_send(
             f"Destiny2/{self.member.member_type}/Account/{self.member.member_id}/Character/{self.character_id}/Stats/Activities/",
             params={'count': activity_count, 'mode': 0, 'page': 0})
 
-        activities: Dict[str, datetime] = dict()
-        # Don't you just love sanity checks :rage:
         if 'ErrorStatus' in response:
-            status = response['ErrorStatus'] # If I don't use this placeholder variable then the check fails :shrug:
-            if status == 'DestinyPrivacyRestriction':
+            if response['ErrorStatus'] == "DestinyPrivacyRestriction":
                 self.member.private = True
 
+        # Don't you just love sanity checks :rage:
         if 'Response' in response:
             if response['Response']:
                 for activity in response['Response']['activities']:
-                    activities[activity['activityDetails']['instanceId']] = datetime.strptime(activity['period'], "%Y-%m-%dT%H:%M:%SZ")
+                    activity_timestamp = datetime.strptime(activity['period'], "%Y-%m-%dT%H:%M:%SZ")
+
+                    if (datetime.now() - activity_timestamp).days < relevant_days:
+                        activities[activity['activityDetails']['instanceId']] = activity_timestamp
 
         return activities
 
 
 if __name__ == '__main__':
     import argparse
-    import statistics
-    import time
     from pprint import pprint
 
-
-    parser = argparse.ArgumentParser(description="A tool to map what clan member play habits. "
+    parser = argparse.ArgumentParser(description = "A tool to map what clan member play habits. "
                                                  "Specifically how often they play with other clan members.")
-    parser.add_argument("apikey", help="Your Bungie API key (https://www.bungie.net/en/Application)")
+    parser.add_argument("apikey", help = "Your Bungie API key (https://www.bungie.net/en/Application)")
+    parser.add_argument("--search_depth", default = 25, help = "How many recent activities to grab for each character")
+    parser.add_argument("--relevant_days", default = 30, help = "Ignore activities older than this")
     args = parser.parse_args()
 
-    bcg = Clan("Box Canyon Guardians", args.apikey)
-    times = list()
-    player_relationships = dict()
-    for m_id, member in bcg.members.items():
-        a = time.time()
-        print(f"\ngathering clan participation for {member.display_name} ({m_id})")
-        print(f"Joined: {member.join_date}")
-        member_relationships = member.recent_clanmates(activity_count=50)
-        if member.private:
-            print("PROFILE IS PRIVATE")
-
+    def print_member_info(member: Member):
         try:
             oldest_activity = min([timestamp for activity_id, timestamp in member.activities.items()])
             oldest_activity = datetime.strftime(oldest_activity, '%Y-%m-%dT%H:%M:%SZ')
@@ -231,8 +235,27 @@ if __name__ == '__main__':
 
         print(f"Oldest Activity: {oldest_activity}")
 
-        player_relationships[m_id] = {member.display_name : member_relationships}
-        times.append(time.time() - a)
-        pprint(member_relationships)
+        pprint(member.player_relationships)
 
-    print(statistics.mean(times))
+    bcg = Clan("Box Canyon Guardians", args.apikey)
+    today = datetime.now()
+    print(f"Searching the last {args.search_depth} activities and ignoring results older than {args.relevant_days} days.")
+    for m_id, member in tqdm(bcg.members.items()):
+        member.recent_players_and_activities()
+
+    # TODO should this be in Clan?
+    for m_id, member in bcg.members.items():
+        if member.private:
+            continue
+
+        print(f"\ngathering clan participation for {member.display_name} ({m_id})")
+        print(f"Joined: {member.join_date}")
+        member.recent_clanmates(activity_count = args.search_depth, relevant_days = args.relevant_days)
+        print_member_info(member)
+
+    print("\nUsing the collected data to infer private player clan activity. This is NOT reliable")
+    for m_id, member in bcg.members.items():
+        if member.private:
+            print(f"\ngathering clan participation for {member.display_name} ({m_id})")
+            print(f"Joined: {member.join_date}")
+            print_member_info(member)
